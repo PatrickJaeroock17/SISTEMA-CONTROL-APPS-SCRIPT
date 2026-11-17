@@ -1,0 +1,132 @@
+const { makeEnv } = require('./mock');
+let pass = 0, fail = 0;
+const check = (name, cond, extra) => { if (cond) { pass++; console.log('  ✅', name); } else { fail++; console.log('  ❌', name, extra !== undefined ? JSON.stringify(extra).slice(0, 300) : ''); } };
+
+const env = makeEnv('dueno@gmail.com');
+const call = (a, p, tok) => { const prev = env._active; if (tok) env._active = ''; try { return env.api(a, p, tok); } finally { env._active = prev; } };
+
+console.log('Inicialización');
+env.inicializarSistema();
+env.inicializarSistema(); // idempotente
+check('7 pestañas creadas', ['CONFIG', 'LOTES', 'USUARIOS', 'TICKETS', 'VENTAS', 'ENTREGAS', 'AUDITORIA'].every(n => env._sheets[n]));
+check('CONFIG sin duplicados tras 2 inicializaciones', env._sheets.CONFIG.getLastRow() === 11, env._sheets.CONFIG.getLastRow());
+let r = call('sesion.info', {});
+check('Dueño reconocido como ADMIN (Google)', r.ok && r.data.usuario.rol === 'ADMIN' && r.data.usuario.via === 'GOOGLE', r);
+check('Lotes iniciales', r.ok && r.data.lotes.map(l => l.lote_id).join() === 'L1,L2,L3');
+
+console.log('Usuarios y PIN');
+check('Crear vendedor', call('usuarios.guardar', { nombre: 'Ana Ventas', correo: 'ana@gmail.com', rol: 'VENTAS', area: 'Logística', pin: '123456' }).ok);
+check('Crear entregador', call('usuarios.guardar', { nombre: 'Beto Entregas', correo: 'beto@gmail.com', rol: 'ENTREGAS', area: 'Logística', pin: '654321' }).ok);
+check('Correo duplicado bloqueado', !call('usuarios.guardar', { nombre: 'X', correo: 'ANA@gmail.com', rol: 'VENTAS' }).ok);
+check('PIN no se guarda en texto plano', !JSON.stringify(env._sheets.USUARIOS.d).includes('123456'));
+env._active = ''; // simulando cuenta @gmail ejecutando como propietario
+check('Sin sesión → NO_AUTH', call('sesion.info', {}).code === 'NO_AUTH');
+check('PIN incorrecto rechazado', !call('auth.login', { correo: 'ana@gmail.com', pin: '000000' }).ok);
+const tAna = call('auth.login', { correo: 'ana@gmail.com', pin: '123456' }).data.token;
+const tBeto = call('auth.login', { correo: 'beto@gmail.com', pin: '654321' }).data.token;
+check('Login con PIN', !!tAna && !!tBeto);
+check('VENTAS no puede generar tickets', call('tickets.generar', { lote_id: 'L1', desde: 1, hasta: 5 }, tAna).code === 'PERMISO');
+check('ENTREGAS no puede vender', call('ventas.registrar', {}, tBeto).code === 'PERMISO');
+for (let i = 0; i < 5; i++) call('auth.login', { correo: 'beto@gmail.com', pin: '111111' });
+check('Bloqueo tras 5 intentos fallidos', /Demasiados/.test(call('auth.login', { correo: 'beto@gmail.com', pin: '654321' }).message));
+env._active = 'dueno@gmail.com';
+
+console.log('Tickets');
+r = call('tickets.generar', { lote_id: 'L1', desde: 1, hasta: 50, vendedor_asignado: 'Ana Ventas' });
+check('Genera 000-001..000-050 en L1', r.ok && r.data.creados === 50, r);
+r = call('tickets.generar', { lote_id: 'L2', desde: 45, hasta: 60 });
+check('Rango solapado: solo crea los nuevos y reporta duplicados', r.ok && r.data.creados === 10 && r.data.ya_existian.length === 6, r);
+r = call('tickets.importar', { lote_id: 'L2', lista: '61, 62 62 000-063' });
+check('Importar lista con duplicado interno', r.ok && r.data.creados === 3 && r.data.duplicados_en_lista.length === 1, r);
+r = call('tickets.generar', { lote_id: 'L3', desde: 100, hasta: 110 });
+check('Tickets en lote PENDIENTE (L3)', r.ok);
+check('Lote actualiza cantidad y rango', call('sesion.info', {}).data.lotes[0].cantidad_asignada === 50 && call('sesion.info', {}).data.lotes[0].rango_fin === '000-050');
+check('Normaliza "7", "007", "000007" → 000-007', ['7', '007', '000007', '000-007'].every(x => env.normNum_(x) === '000-007'));
+check('Rechaza número demasiado largo', env.normNum_('1234567') === '');
+
+console.log('Ventas');
+const venta = (tks, pago, tok, extra) => call('ventas.registrar', Object.assign({ tickets: tks, comprador: 'Juan Pérez', telefono: '+51 987654321', metodo_pago: 'YAPE', estado_pago: pago }, extra || {}), tok);
+r = venta(['1', '2', '3'], 'PAGADO', tAna);
+check('Venta de 3 tickets en una operación', r.ok && r.data.total === 54 && r.data.tickets.length === 3, r);
+const op1 = r.data.operacion_id;
+check('3 filas en VENTAS con mismo operacion_id', env.read_('VENTAS').filter(v => v.operacion_id === op1).length === 3);
+check('Teléfono +51 guardado como texto', env.read_('VENTAS')[0].telefono_comprador === '+51 987654321');
+r = venta(['3'], 'PAGADO', tAna);
+check('Vender de nuevo el mismo ticket → bloqueado', !r.ok && r.code === 'DUPLICADO', r);
+r = venta(['4', '3'], 'PAGADO', tAna);
+check('Operación con un ticket ya vendido → no guarda ninguno', !r.ok && env.read_('TICKETS').find(t => t.numero_ticket === '000-004').estado_ticket === 'DISPONIBLE');
+check('Ticket inexistente', /no encontrado/.test(venta(['999'], 'PAGADO', tAna).message));
+check('Ticket de lote PENDIENTE no se vende', /lote activo/.test(venta(['100'], 'PAGADO', tAna).message));
+check('VENTAS no cambia precio', venta(['5'], 'PAGADO', tAna, { precio_unitario: 10 }).code === 'PERMISO');
+check('Comprador obligatorio', !call('ventas.registrar', { tickets: ['5'], comprador: '', metodo_pago: 'YAPE', estado_pago: 'PAGADO' }, tAna).ok);
+check('Inyección de fórmula neutralizada', venta(['6'], 'PENDIENTE', tAna, { comprador: '=HYPERLINK("x")' }).ok && env._sheets.VENTAS.d.some(r => r[6] === '=HYPERLINK("x")'));
+r = venta(['7'], 'PENDIENTE', tAna);
+const opPend = r.data.operacion_id;
+
+console.log('Entregas');
+const ent = (n, tok) => call('entregas.confirmar', { numero: n }, tok);
+check('Ticket inexistente → "Ticket no encontrado"', call('entregas.consultar', { numero: '888' }, tBeto).data.mensaje === 'Ticket no encontrado');
+check('Entregar ticket no vendido → bloqueado', ent('10', tBeto).code === 'SIN_VENTA');
+check('Entregar ticket con pago pendiente → bloqueado', ent('7', tBeto).message === 'Pago pendiente. Solicita validación al administrador');
+r = ent('1', tBeto);
+check('Entregar ticket pagado → ENTREGADO', r.ok && r.data.entrega_id, r);
+r = ent('1', tBeto);
+check('Entregarlo otra vez → ALERTA con fecha', r.code === 'YA_ENTREGADO' && /^ALERTA: este ticket ya fue entregado el \d\d\/\d\d\/\d{4} \d\d:\d\d:\d\d/.test(r.message), r);
+check('Intento duplicado queda en AUDITORIA', env.read_('AUDITORIA').some(a => a.accion === 'INTENTO_ENTREGA_DUPLICADA'));
+check('ENTREGAS no confirma pagos', call('ventas.confirmarPago', { operacion_id: opPend }, tBeto).code === 'PERMISO');
+check('Vendedor confirma pago de su venta', call('ventas.confirmarPago', { operacion_id: opPend, metodo_pago: 'EFECTIVO' }, tAna).ok);
+check('Tras confirmar pago, se entrega', ent('7', tBeto).ok);
+check('Anular ticket con venta activa → bloqueado', !call('tickets.anular', { numero: '2', motivo: 'perdido en clase' }).ok);
+check('Anular ticket disponible', call('tickets.anular', { numero: '11', motivo: 'ticket extraviado' }).ok);
+check('Entregar ticket anulado → bloqueado', ent('11', tBeto).code === 'ANULADO');
+check('Vender ticket anulado → bloqueado', !venta(['11'], 'PAGADO', tAna).ok);
+
+console.log('Correcciones de administrador');
+const eid = env.read_('ENTREGAS')[0].entrega_id;
+check('VENTAS no revierte entregas', call('entregas.revertir', { entrega_id: eid, motivo: 'error de digitación' }, tAna).code === 'PERMISO');
+check('Revertir sin motivo → bloqueado', !call('entregas.revertir', { entrega_id: eid, motivo: '' }).ok);
+check('Admin revierte con motivo', call('entregas.revertir', { entrega_id: eid, motivo: 'error de digitación' }).ok);
+check('La fila de entrega se conserva como REVERTIDO', env.read_('ENTREGAS').find(e => e.entrega_id === eid).estado_entrega === 'REVERTIDO');
+check('Tras reversión puede entregarse de nuevo', ent('1', tBeto).ok);
+check('Anular venta entregada → bloqueado', !call('ventas.anular', { operacion_id: op1, motivo: 'cliente desistió' }).ok);
+const v3 = env.read_('VENTAS').find(v => v.numero_ticket === '000-003').venta_id;
+check('Anular venta individual', call('ventas.anular', { venta_id: v3, motivo: 'cliente desistió' }).ok);
+check('Ticket vuelve a DISPONIBLE y fila de venta se conserva', env.read_('TICKETS').find(t => t.numero_ticket === '000-003').estado_ticket === 'DISPONIBLE' && env.read_('VENTAS').find(v => v.venta_id === v3).estado_pago === 'ANULADO');
+check('Ticket liberado se puede revender', venta(['3'], 'PAGADO', tAna).ok);
+const v2 = env.read_('VENTAS').find(v => v.numero_ticket === '000-002').venta_id;
+check('Corregir comprador con auditoría', call('ventas.corregir', { venta_id: v2, cambios: { comprador: 'Juana Pérez' }, motivo: 'nombre mal escrito' }).ok && env.read_('AUDITORIA').some(a => a.accion === 'CORREGIR_VENTA' && /Juana/.test(a.valor_nuevo)));
+check('Reasignar vendedor de tickets disponibles', call('tickets.asignar', { desde: '20', hasta: '25', vendedor_asignado: 'Carla' }).ok && env.read_('TICKETS').find(t => t.numero_ticket === '000-022').vendedor_asignado === 'Carla');
+check('No reasigna tickets vendidos', !call('tickets.asignar', { lista: '1 2', vendedor_asignado: 'Carla' }).ok);
+
+console.log('Dashboard');
+r = call('dashboard.get', {});
+const V = env.read_('VENTAS').filter(v => v.estado_pago !== 'ANULADO');
+const E = env.read_('ENTREGAS').filter(e => e.estado_entrega === 'ENTREGADO');
+const k = r.data.kpis;
+check('Total tickets', k.total === env.read_('TICKETS').length, k);
+check('Vendidos = ventas activas', k.vendidos === V.length, [k.vendidos, V.length]);
+check('Recaudado = suma PAGADO', k.recaudado === V.filter(v => v.estado_pago === 'PAGADO').reduce((s, v) => s + v.precio_unitario, 0));
+check('Por cobrar = suma PENDIENTE', k.por_cobrar === V.filter(v => v.estado_pago === 'PENDIENTE').reduce((s, v) => s + v.precio_unitario, 0));
+check('Entregados = entregas activas', k.entregados === E.length, [k.entregados, E.length]);
+check('Disponibles + vendidos + anulados = total', k.disponibles + k.vendidos + k.anulados === k.total);
+check('Sin alertas de integridad', r.data.alertas.length === 0, r.data.alertas);
+check('Filtro por lote L2', call('dashboard.get', { lote: 'L2' }).data.kpis.total === 13);
+check('Filtro estado POR_RECOGER', call('dashboard.get', { estado: 'POR_RECOGER' }).data.kpis.total === k.por_recoger);
+check('VENTAS solo ve sus ventas', call('ventas.listar', {}, tAna).data.rows.every(x => x.registrado_por === 'ana@gmail.com'));
+check('Reporte de rendición', call('reportes.get', {}).data.rendicion.length > 0);
+
+console.log('DEMO');
+r = call('demo.pruebas', {});
+check('Pruebas DEMO integradas: todas OK', r.ok && r.data.ok, r.ok ? r.data.resultados.filter(x => !x.ok) : r);
+if (r.ok) r.data.resultados.forEach(x => console.log('     ', x.ok ? '✓' : '✗', x.caso));
+check('DEMO no contamina dashboard real', call('dashboard.get', {}).data.kpis.total === k.total);
+const realV = env.read_('VENTAS').filter(v => !env.isTrue_(v.es_demo)).length, realT = env.read_('TICKETS').filter(t => !env.isTrue_(t.es_demo)).length;
+r = call('demo.archivar', {});
+check('Archivar DEMO', r.ok, r);
+check('Datos reales intactos tras archivar', env.read_('VENTAS').length === realV && env.read_('TICKETS').length === realT);
+check('Archivo DEMO creado', !!env._sheets.ARCHIVO_DEMO_VENTAS && env._sheets.ARCHIVO_DEMO_VENTAS.getLastRow() > 1);
+check('Integridad tras archivar', call('dashboard.get', {}).data.alertas.length === 0);
+check('Nuevo ID no reutiliza IDs archivados', venta(['30'], 'PAGADO', tAna).ok && !env._sheets.ARCHIVO_DEMO_VENTAS.d.some(r => r[0] === env.read_('VENTAS').slice(-1)[0].venta_id));
+
+console.log(`\n${pass} OK, ${fail} fallas`);
+process.exit(fail ? 1 : 0);

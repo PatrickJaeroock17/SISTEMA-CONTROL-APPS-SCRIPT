@@ -1,0 +1,13 @@
+{
+  "name": "pollada-ccat-sistema",
+  "version": "1.0.0",
+  "description": "Sistema de control de ventas y entregas para la Pollada CCATina 2026 (Google Sheets + Apps Script)",
+  "private": true,
+  "scripts": {
+    "test": "node test/run.js && node test/ui.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  },
+  "license": "MIT"
+}

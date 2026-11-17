@@ -1,0 +1,560 @@
+<script>
+/* ================== Estado y utilidades ================== */
+const S = { token: null, info: null, tab: null, cart: [], recientes: [] };
+const $ = (s, el) => (el || document).querySelector(s);
+const $$ = (s, el) => Array.from((el || document).querySelectorAll(s));
+const esc = s => String(s === undefined || s === null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const money = n => 'S/ ' + Number(n || 0).toFixed(2);
+const badge = s => s ? `<span class="b ${esc(s)}">${esc(s.replace('_', ' '))}</span>` : '';
+const demoB = r => r.es_demo ? ' <span class="b DEMO">DEMO</span>' : '';
+const isAdmin = () => S.info && S.info.usuario.rol === 'ADMIN';
+const store = {
+  get(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { v === null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch (e) {} }
+};
+
+function api(action, payload) {
+  return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(r => {
+        if (r && r.ok) return resolve(r.data);
+        if (r && r.code === 'NO_AUTH') { S.token = null; store.set('tk', null); showLogin(r.message); }
+        reject(r || { message: 'Sin respuesta del servidor.' });
+      })
+      .withFailureHandler(e => reject({ message: 'Error de conexión: ' + (e && e.message ? e.message : e) }))
+      .api(action, payload || {}, S.token);
+  });
+}
+
+function toast(msg, type) {
+  const t = document.createElement('div');
+  t.className = 'toast ' + (type || 'info');
+  t.textContent = msg;
+  $('#toasts').appendChild(t);
+  setTimeout(() => t.remove(), type === 'err' ? 7000 : 4000);
+}
+const fail = e => toast((e && e.message) || 'Error', 'err');
+
+function modal(title, html, buttons) {
+  return new Promise(resolve => {
+    const m = $('#modal');
+    m.innerHTML = `<h3>${esc(title)}</h3><div>${html}</div><div class="actions">${(buttons || [{ v: false, t: 'Cancelar', c: 'sec' }, { v: true, t: 'Confirmar' }]).map((b, i) => `<button type="button" class="btn ${b.c || ''}" data-i="${i}">${esc(b.t)}</button>`).join('')}</div>`;
+    $('#modalBg').hidden = false;
+    const bs = buttons || [{ v: false }, { v: true }];
+    $$('.actions button', m).forEach(btn => btn.onclick = () => {
+      const b = bs[+btn.dataset.i];
+      const form = {};
+      $$('[data-f]', m).forEach(i => form[i.dataset.f] = i.type === 'checkbox' ? i.checked : i.value);
+      $('#modalBg').hidden = true;
+      resolve(b.v ? (Object.keys(form).length ? form : true) : false);
+    });
+  });
+}
+
+async function busy(btn, fn) {
+  if (btn) { btn.disabled = true; btn.dataset.t = btn.textContent; btn.textContent = 'Procesando…'; }
+  try { return await fn(); } finally { if (btn) { btn.disabled = false; btn.textContent = btn.dataset.t; } }
+}
+
+function table(cols, rows, empty) {
+  if (!rows.length) return `<p class="muted">${esc(empty || 'Sin registros.')}</p>`;
+  return `<div class="tbl-wrap"><table><thead><tr>${cols.map(c => `<th class="${c.r ? 'right' : ''}">${esc(c.h)}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${cols.map(c => `<td class="${c.r ? 'right' : ''}">${c.f ? c.f(r) : esc(r[c.k])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+
+function opts(list, sel, blank) {
+  return (blank !== undefined ? `<option value="">${esc(blank)}</option>` : '') + list.map(o => {
+    const v = typeof o === 'object' ? o.v : o, t = typeof o === 'object' ? o.t : o;
+    return `<option value="${esc(v)}" ${String(v) === String(sel) ? 'selected' : ''}>${esc(t)}</option>`;
+  }).join('');
+}
+
+/* ================== Arranque y sesión ================== */
+const TABS = [
+  { id: 'dashboard', t: 'Dashboard', roles: ['ADMIN', 'VENTAS', 'LECTURA'], r: vDashboard },
+  { id: 'ventas', t: 'Ventas', roles: ['ADMIN', 'VENTAS'], r: vVentas },
+  { id: 'entregas', t: 'Entregas', roles: ['ADMIN', 'ENTREGAS'], r: vEntregas },
+  { id: 'tickets', t: 'Tickets', roles: ['ADMIN', 'VENTAS', 'LECTURA'], r: vTickets },
+  { id: 'reportes', t: 'Reportes', roles: ['ADMIN', 'VENTAS', 'LECTURA'], r: vReportes },
+  { id: 'config', t: 'Configuración', roles: ['ADMIN'], r: vConfig }
+];
+
+async function boot() {
+  S.token = S.token || store.get('tk');
+  try {
+    S.info = await api('sesion.info');
+  } catch (e) { if (e.code !== 'NO_AUTH') $('#main').innerHTML = `<div class="alert err">${esc(e.message)}</div>`; return; }
+  const u = S.info.usuario, c = S.info.config;
+  $('#brandTitle').textContent = c.nombre_actividad;
+  $('#brandSub').textContent = `Recojo: ${c.fecha_actividad} · ${c.lugar_recojo} · ${money(c.precio_unitario)}`;
+  $('#userName').textContent = u.nombre;
+  $('#userRole').textContent = u.rol;
+  $('#userBox').hidden = false;
+  const mine = TABS.filter(t => t.roles.indexOf(u.rol) >= 0);
+  const nav = $('#tabs');
+  nav.innerHTML = mine.map(t => `<button type="button" data-t="${t.id}">${t.t}</button>`).join('');
+  nav.hidden = mine.length < 2;
+  $$('button', nav).forEach(b => b.onclick = () => go(b.dataset.t));
+  const pedida = document.body.dataset.vista;
+  go(mine.some(t => t.id === pedida) ? pedida : (S.tab && mine.some(t => t.id === S.tab) ? S.tab : mine[0].id));
+}
+
+function go(id) {
+  S.tab = id;
+  $$('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.t === id));
+  $('#main').innerHTML = '<div class="loading">Cargando…</div>';
+  TABS.find(t => t.id === id).r();
+}
+
+function showLogin(msg) {
+  $('#tabs').hidden = true; $('#userBox').hidden = true;
+  $('#main').innerHTML = `<div class="card login">
+    <h2>Ingresar</h2>
+    <div class="alert info">${esc(msg || 'Inicia sesión para continuar.')}</div>
+    <form id="fLogin">
+      <label>Correo <span class="req">*</span></label><input id="lCorreo" type="email" autocomplete="username" required>
+      <label class="mt">PIN <span class="req">*</span></label><input id="lPin" type="password" inputmode="numeric" autocomplete="current-password" required>
+      <button class="btn mt" style="width:100%" type="submit">Ingresar</button>
+    </form>
+    <p class="muted mt">¿No tienes PIN? Pídelo al administrador del sistema. Nunca compartas tu PIN.</p></div>`;
+  $('#fLogin').onsubmit = async ev => {
+    ev.preventDefault();
+    const btn = $('#fLogin button');
+    await busy(btn, async () => {
+      try {
+        const r = await api('auth.login', { correo: $('#lCorreo').value, pin: $('#lPin').value });
+        S.token = r.token; store.set('tk', r.token); boot();
+      } catch (e) { fail(e); }
+    });
+  };
+}
+
+$('#btnLogout').onclick = async () => {
+  try { await api('auth.logout'); } catch (e) {}
+  S.token = null; store.set('tk', null); S.info = null;
+  if (S.info === null) showLogin('Sesión cerrada. Si entraste con tu cuenta Google, cierra la pestaña.');
+};
+
+/* ================== Filtros comunes ================== */
+function filtrosHTML(id, conEstado) {
+  const i = S.info;
+  return `<div class="row noprint" id="${id}">
+    <div><label>Lote</label><select data-k="lote">${opts(i.lotes.map(l => ({ v: l.lote_id, t: l.lote_id + ' · ' + l.nombre_lote })), '', 'Todos')}</select></div>
+    <div><label>Área</label><select data-k="area">${opts(i.areas, '', 'Todas')}</select></div>
+    <div><label>Vendedor</label><select data-k="vendedor">${opts(i.vendedores, '', 'Todos')}</select></div>
+    ${conEstado !== false ? `<div><label>Estado</label><select data-k="estado">${opts([['DISPONIBLE', 'Disponible'], ['VENDIDO', 'Vendido'], ['ANULADO', 'Anulado'], ['PAGADO', 'Pagado'], ['PENDIENTE', 'Pago pendiente'], ['ENTREGADO', 'Entregado'], ['POR_RECOGER', 'Por recoger']].map(x => ({ v: x[0], t: x[1] })), '', 'Todos')}</select></div>` : ''}
+    <div><label>Datos</label><select data-k="demo">${opts([{ v: 'excluir', t: 'Reales' }, { v: 'solo', t: 'Solo DEMO' }, { v: 'incluir', t: 'Reales + DEMO' }], 'excluir')}</select></div>
+  </div>`;
+}
+const leerFiltros = id => { const f = {}; $$(`#${id} [data-k]`).forEach(s => { if (s.value) f[s.dataset.k] = s.value; }); return f; };
+const onFiltros = (id, fn) => $$(`#${id} [data-k]`).forEach(s => s.onchange = fn);
+
+/* ================== DASHBOARD ================== */
+function vDashboard() {
+  $('#main').innerHTML = `<h2>Dashboard</h2>${filtrosHTML('fd')}<div id="dash" class="mt"><div class="loading">Calculando…</div></div>`;
+  const load = async () => {
+    $('#dash').innerHTML = '<div class="loading">Calculando…</div>';
+    try {
+      const d = await api('dashboard.get', leerFiltros('fd')), k = d.kpis;
+      const kp = (v, l, cls) => `<div class="kpi ${cls || ''}"><div class="v">${v}</div><div class="l">${l}</div></div>`;
+      const pct = (a, b) => b ? Math.round(100 * a / b) : 0;
+      $('#dash').innerHTML = `
+        ${d.alertas.length ? `<div class="alert err">⚠ Revisar integridad de datos:\n${d.alertas.map(esc).join('\n')}</div>` : ''}
+        <div class="sect">Tickets</div>
+        <div class="grid g4">${kp(k.total, 'Total tickets')}${kp(k.disponibles, 'Disponibles')}${kp(k.vendidos, 'Vendidos')}${kp(k.anulados, 'Anulados')}</div>
+        <div class="sect">Pagos (vendido ≠ cobrado)</div>
+        <div class="grid g4">${kp(k.pagados, 'Pagados')}${kp(k.pendientes, 'Pago pendiente', 'pend')}${kp(money(k.recaudado), 'Recaudación confirmada', 'money')}${kp(money(k.por_cobrar), 'Pendiente de cobro', 'pend')}</div>
+        <div class="sect">Entregas</div>
+        <div class="grid g4">${kp(k.entregados, 'Entregados')}${kp(k.por_recoger, 'Por recoger', 'pend')}${kp(pct(k.vendidos, k.total) + '%', 'Avance de venta')}${kp(pct(k.entregados, k.vendidos) + '%', 'Avance de recojo')}</div>
+        <div class="grid g2 mt">
+          <div class="card"><h3>Por lote</h3>${table([
+            { h: 'Lote', f: r => `<b>${esc(r.lote_id)}</b> ${esc(r.nombre || '')}<div class="muted">${esc(r.area || '')}</div>` },
+            { h: 'Asig.', k: 'asignados', r: 1 }, { h: 'Vend.', k: 'vendidos', r: 1 },
+            { h: 'Avance', f: r => `<div class="bar"><i style="width:${pct(r.vendidos, r.asignados)}%"></i></div><span class="muted">${pct(r.vendidos, r.asignados)}%</span>` },
+            { h: 'Pag.', k: 'pagados', r: 1 }, { h: 'Entr.', k: 'entregados', r: 1 }, { h: 'Cobrado', f: r => money(r.recaudado), r: 1 }], d.por_lote)}</div>
+          <div class="card"><h3>Por área</h3>${table([{ h: 'Área', k: 'area' }, { h: 'Vend.', k: 'vendidos', r: 1 }, { h: 'Pag.', k: 'pagados', r: 1 }, { h: 'Pend.', k: 'pendientes', r: 1 }, { h: 'Cobrado', f: r => money(r.recaudado), r: 1 }, { h: 'Por cobrar', f: r => money(r.por_cobrar), r: 1 }], d.por_area)}</div>
+        </div>
+        <div class="card"><h3>Por vendedor</h3>${table([{ h: 'Vendedor', k: 'vendedor' }, { h: 'Vendidos', k: 'vendidos', r: 1 }, { h: 'Pagados', k: 'pagados', r: 1 }, { h: 'Pendientes', k: 'pendientes', r: 1 }, { h: 'Entregados', k: 'entregados', r: 1 }, { h: 'Cobrado', f: r => money(r.recaudado), r: 1 }, { h: 'Por cobrar', f: r => money(r.por_cobrar), r: 1 }], d.por_vendedor, 'Aún no hay ventas.')}</div>
+        <p class="muted">Datos leídos de Google Sheets el ${esc(d.generado)}. <button class="btn sec sm" id="btnRef" type="button">Actualizar</button></p>`;
+      $('#btnRef').onclick = load;
+    } catch (e) { $('#dash').innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
+  };
+  onFiltros('fd', load); load();
+}
+
+/* ================== VENTAS ================== */
+function vVentas() {
+  const c = S.info.config;
+  S.cart = [];
+  $('#main').innerHTML = `<h2>Ventas</h2>
+  <div class="card">
+    <h3>Registrar venta</h3>
+    <label>Tickets <span class="req">*</span> <span class="muted">(escribe el número y presiona Enter o Agregar; puedes pegar varios separados por coma)</span></label>
+    <div class="row"><input id="vNum" inputmode="numeric" placeholder="Ej.: 1 o 000-001" autocomplete="off"><button class="btn sec" id="vAdd" type="button" style="flex:0 0 auto">Agregar</button></div>
+    <div class="chips" id="vChips"></div>
+    <div class="grid g2 mt">
+      <div><label>Comprador <span class="req">*</span></label><input id="vComp" maxlength="80" placeholder="Nombre y apellido"></div>
+      <div><label>Teléfono (opcional)</label><input id="vTel" inputmode="tel" maxlength="20" placeholder="+51 9xx xxx xxx"></div>
+      <div><label>Vendedor <span class="req">*</span></label><input id="vVend" list="dlVend" maxlength="60" value="${esc(S.info.usuario.nombre)}"><datalist id="dlVend">${S.info.vendedores.map(v => `<option value="${esc(v)}">`).join('')}</datalist></div>
+      <div><label>Método de pago <span class="req">*</span></label><select id="vMet">${opts(c.metodos_pago, c.metodos_pago[0])}</select></div>
+      <div><label>Estado de pago <span class="req">*</span></label><div class="seg" id="vPago"><button type="button" class="on PAGADO" data-v="PAGADO">PAGADO</button><button type="button" class="PENDIENTE" data-v="PENDIENTE">PENDIENTE</button></div></div>
+      <div><label>Precio unitario</label><input id="vPrecio" type="number" min="0" step="0.5" value="${esc(c.precio_unitario)}" ${isAdmin() ? '' : 'readonly'}></div>
+    </div>
+    <label class="mt">Observaciones</label><textarea id="vObs" maxlength="300"></textarea>
+    <div class="row mt" style="align-items:center"><div class="total" id="vTotal">Total: ${money(0)}</div><button class="btn" id="vSave" type="button" style="flex:0 0 auto">Registrar venta</button></div>
+  </div>
+  <div class="card"><h3>Historial de ventas</h3>
+    <div class="row noprint"><div><label>Buscar</label><input id="hQ" placeholder="Ticket, comprador, operación…"></div>
+    <div><label>Pago</label><select id="hPago">${opts([{ v: 'PAGADO', t: 'Pagado' }, { v: 'PENDIENTE', t: 'Pendiente' }, { v: 'ANULADO', t: 'Anulado' }], '', 'Todos')}</select></div>
+    <div><label>Datos</label><select id="hDemo">${opts([{ v: 'excluir', t: 'Reales' }, { v: 'solo', t: 'Solo DEMO' }, { v: 'incluir', t: 'Todos' }], 'excluir')}</select></div></div>
+    <div id="hist" class="mt"></div></div>`;
+
+  let pago = 'PAGADO';
+  $$('#vPago button').forEach(b => b.onclick = () => { pago = b.dataset.v; $$('#vPago button').forEach(x => x.classList.toggle('on', x === b)); });
+  const precio = () => Number($('#vPrecio').value || 0);
+  const render = () => {
+    $('#vChips').innerHTML = S.cart.map((t, i) => `<span class="chip">${esc(t.numero)}${t.es_demo ? ' (DEMO)' : ''} <span class="muted">${esc(t.lote_id)}</span><button type="button" data-i="${i}" aria-label="Quitar">×</button></span>`).join('');
+    $$('#vChips button').forEach(b => b.onclick = () => { S.cart.splice(+b.dataset.i, 1); render(); });
+    $('#vTotal').textContent = `Total: ${money(precio() * S.cart.length)} (${S.cart.length} ticket${S.cart.length === 1 ? '' : 's'})`;
+  };
+  $('#vPrecio').oninput = render;
+  const add = async () => {
+    const parts = $('#vNum').value.split(/[\s,;]+/).filter(Boolean);
+    if (!parts.length) return;
+    $('#vNum').value = '';
+    for (const p of parts) {
+      try {
+        const r = await api('tickets.consultar', { numero: p });
+        if (S.cart.some(t => t.numero === r.numero)) { toast(r.numero + ' ya está en la lista', 'warn'); continue; }
+        if (!r.disponible) { toast(`${r.numero}: ${r.motivo}`, 'err'); continue; }
+        S.cart.push(r);
+        if (S.cart.length === 1 && r.vendedor_asignado && !isAdmin()) $('#vVend').value = r.vendedor_asignado;
+        render();
+      } catch (e) { fail(e); }
+    }
+    $('#vNum').focus();
+  };
+  $('#vAdd').onclick = add;
+  $('#vNum').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); add(); } };
+  $('#vSave').onclick = async () => {
+    const comp = $('#vComp').value.trim();
+    if (!S.cart.length) return toast('Agrega al menos un ticket.', 'warn');
+    if (comp.length < 3) return toast('Escribe el nombre del comprador.', 'warn');
+    if (!$('#vVend').value.trim()) return toast('Indica el vendedor.', 'warn');
+    const ok = await modal('Confirmar venta', `<p><b>${S.cart.length}</b> ticket(s): ${S.cart.map(t => esc(t.numero)).join(', ')}</p>
+      <p>Comprador: <b>${esc(comp)}</b><br>Vendedor: ${esc($('#vVend').value)}<br>Pago: ${badge(pago)} · ${esc($('#vMet').value)}</p>
+      <p class="total">Total: ${money(precio() * S.cart.length)}</p>${pago === 'PENDIENTE' ? '<div class="alert warn">El pago queda PENDIENTE: no se podrá recoger hasta confirmarlo.</div>' : ''}`);
+    if (!ok) return;
+    await busy($('#vSave'), async () => {
+      try {
+        const r = await api('ventas.registrar', { tickets: S.cart.map(t => t.numero), comprador: comp, telefono: $('#vTel').value, vendedor: $('#vVend').value, metodo_pago: $('#vMet').value, estado_pago: pago, precio_unitario: $('#vPrecio').value, observaciones: $('#vObs').value });
+        toast(`✔ Venta ${r.operacion_id} registrada: ${r.tickets.join(', ')} · ${money(r.total)}`, 'ok');
+        S.cart = []; ['vComp', 'vTel', 'vObs'].forEach(id => $('#' + id).value = ''); render(); hist();
+      } catch (e) { fail(e); }
+    });
+  };
+
+  const hist = async () => {
+    $('#hist').innerHTML = '<div class="loading">Cargando…</div>';
+    try {
+      const d = await api('ventas.listar', { q: $('#hQ').value, estado_pago: $('#hPago').value, demo: $('#hDemo').value });
+      $('#hist').innerHTML = `<p class="muted">${d.total} venta(s)${d.total > d.rows.length ? ', mostrando ' + d.rows.length : ''}</p>` + table([
+        { h: 'Ticket', f: r => `<b>${esc(r.numero_ticket)}</b>${demoB(r)}<div class="muted">${esc(r.operacion_id)}</div>` },
+        { h: 'Comprador', f: r => esc(r.comprador) + (r.telefono_comprador ? `<div class="muted">${esc(r.telefono_comprador)}</div>` : '') },
+        { h: 'Vendedor', k: 'vendedor' }, { h: 'Fecha', k: 'fecha_venta' },
+        { h: 'Monto', f: r => money(r.precio_unitario), r: 1 },
+        { h: 'Pago', f: r => badge(r.estado_pago) + `<div class="muted">${esc(r.metodo_pago)}</div>` },
+        { h: '', f: r => `${r.puede_confirmar ? `<button class="btn ok sm" data-a="pagar" data-id="${esc(r.venta_id)}" type="button">Confirmar pago</button> ` : ''}${isAdmin() && r.estado_pago !== 'ANULADO' ? `<button class="btn sec sm" data-a="corr" data-id="${esc(r.venta_id)}" type="button">Corregir</button> <button class="btn danger sm" data-a="anul" data-id="${esc(r.venta_id)}" type="button">Anular</button>` : ''}` }
+      ], d.rows, 'No hay ventas con esos filtros.');
+      $$('#hist [data-a]').forEach(b => b.onclick = () => accionVenta(b.dataset.a, d.rows.find(x => x.venta_id === b.dataset.id), hist));
+    } catch (e) { $('#hist').innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
+  };
+  let tmr; $('#hQ').oninput = () => { clearTimeout(tmr); tmr = setTimeout(hist, 400); };
+  $('#hPago').onchange = hist; $('#hDemo').onchange = hist;
+  render(); hist(); $('#vNum').focus();
+}
+
+async function accionVenta(a, r, after) {
+  const met = S.info.config.metodos_pago;
+  try {
+    if (a === 'pagar') {
+      const f = await modal('Confirmar pago', `<p>Ticket <b>${esc(r.numero_ticket)}</b> · ${esc(r.comprador)} · ${money(r.precio_unitario)}</p>
+        <label>Método con el que pagó</label><select data-f="metodo_pago">${opts(met, r.metodo_pago)}</select>
+        <label class="mt"><input type="checkbox" data-f="toda" style="width:auto"> Confirmar toda la operación ${esc(r.operacion_id)}</label>`);
+      if (!f) return;
+      const x = await api('ventas.confirmarPago', f.toda ? { operacion_id: r.operacion_id, metodo_pago: f.metodo_pago } : { venta_id: r.venta_id, metodo_pago: f.metodo_pago });
+      toast(`✔ Pago confirmado: ${x.tickets.join(', ')}`, 'ok');
+    }
+    if (a === 'anul') {
+      const f = await modal('Anular venta', `<div class="alert warn">La fila se conserva con estado ANULADO y queda en auditoría.</div>
+        <p>Ticket <b>${esc(r.numero_ticket)}</b> · ${esc(r.comprador)}</p>
+        <label>Motivo <span class="req">*</span></label><textarea data-f="motivo"></textarea>
+        <label class="mt"><input type="checkbox" data-f="toda" style="width:auto"> Anular toda la operación ${esc(r.operacion_id)}</label>
+        <label class="mt"><input type="checkbox" data-f="anular_ticket" style="width:auto"> Además anular el ticket físico (no se podrá revender)</label>`, [{ v: false, t: 'Cancelar', c: 'sec' }, { v: true, t: 'Anular venta', c: 'danger' }]);
+      if (!f) return;
+      const x = await api('ventas.anular', Object.assign(f.toda ? { operacion_id: r.operacion_id } : { venta_id: r.venta_id }, { motivo: f.motivo, anular_ticket: f.anular_ticket }));
+      toast(`Venta anulada (${x.anuladas}). Ticket → ${x.estado_ticket}`, 'warn');
+    }
+    if (a === 'corr') {
+      const f = await modal('Corregir venta ' + r.venta_id, `<label>Comprador</label><input data-f="comprador" value="${esc(r.comprador)}">
+        <label class="mt">Teléfono</label><input data-f="telefono_comprador" value="${esc(r.telefono_comprador)}">
+        <label class="mt">Vendedor</label><input data-f="vendedor" value="${esc(r.vendedor)}">
+        <label class="mt">Método de pago</label><select data-f="metodo_pago">${opts(met, r.metodo_pago)}</select>
+        <label class="mt">Precio unitario</label><input data-f="precio_unitario" type="number" step="0.5" value="${esc(r.precio_unitario)}">
+        <label class="mt">Observaciones</label><input data-f="observaciones" value="${esc(r.observaciones)}">
+        <label class="mt">Motivo de la corrección <span class="req">*</span></label><textarea data-f="motivo"></textarea>`);
+      if (!f) return;
+      const motivo = f.motivo; delete f.motivo;
+      if (!r.telefono_comprador && !f.telefono_comprador) delete f.telefono_comprador;
+      await api('ventas.corregir', { venta_id: r.venta_id, cambios: f, motivo: motivo });
+      toast('✔ Venta corregida (registrado en auditoría)', 'ok');
+    }
+    after && after();
+  } catch (e) { fail(e); }
+}
+
+/* ================== ENTREGAS ================== */
+function vEntregas() {
+  const c = S.info.config;
+  $('#main').innerHTML = `<div class="ent-wrap">
+    <h2>Entrega de polladas</h2>
+    <p class="muted">${esc(c.lugar_recojo)} · ${c.requiere_pago_confirmado === 'SI' ? 'Solo se entregan tickets con pago confirmado.' : 'Se permite entregar con pago pendiente (con aviso).'}</p>
+    <form id="fEnt"><input id="eNum" class="ent-input" inputmode="numeric" placeholder="N° de ticket" autocomplete="off" aria-label="Número de ticket">
+    <button class="btn xl mt" type="submit">Buscar ticket</button></form>
+    <div id="eRes"></div>
+    <div class="card mt"><h3>Últimas entregas</h3><div id="eRec" class="list-mini"><span class="muted">Cargando…</span></div></div>
+  </div>`;
+  const rec = async () => {
+    try {
+      const l = await api('entregas.recientes');
+      $('#eRec').innerHTML = l.length ? l.map(x => `<div><b>${esc(x.numero)}</b><span>${esc(x.comprador)}</span><span class="muted">${esc(x.fecha.slice(11, 16))}</span></div>`).join('') : '<span class="muted">Aún no hay entregas.</span>';
+    } catch (e) { $('#eRec').innerHTML = ''; }
+  };
+  const buscar = async (num) => {
+    const n = num || $('#eNum').value.trim();
+    if (!n) return;
+    $('#eRes').innerHTML = '<div class="loading">Consultando…</div>';
+    try { pintar(await api('entregas.consultar', { numero: n })); } catch (e) { $('#eRes').innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
+  };
+  const pintar = r => {
+    const t = r.ticket;
+    const cls = r.ok ? 'OK' : (r.codigo === 'PAGO_PENDIENTE' ? 'PEND' : 'BAD');
+    const icon = r.ok ? '✅' : (cls === 'PEND' ? '⏳' : '⛔');
+    if (!r.ok && navigator.vibrate) { try { navigator.vibrate([200, 100, 200]); } catch (e) {} }
+    $('#eRes').innerHTML = `<div class="verdict ${cls}">
+      <div class="big">${icon} ${esc(r.mensaje)}</div>
+      ${t ? `<dl><dt>Ticket</dt><dd>${esc(t.numero)}${demoB(t)}</dd><dt>Comprador</dt><dd>${esc(t.comprador || '—')}</dd>
+        <dt>Pago</dt><dd>${badge(t.estado_pago.replace(' ', '_'))}</dd><dt>Entrega</dt><dd>${badge(t.estado_entrega)}${t.fecha_entrega ? ' ' + esc(t.fecha_entrega) : ''}</dd>
+        ${t.vendedor ? `<dt>Vendedor</dt><dd>${esc(t.vendedor)}</dd>` : ''}</dl>` : ''}
+    </div>
+    ${r.ok ? `<label>Observaciones (opcional)</label><input id="eObs" maxlength="200" placeholder="Ej.: recogió un familiar">
+      <button class="btn ok xl mt" id="eConf" type="button">Confirmar entrega</button>` : ''}
+    ${isAdmin() && r.codigo === 'PAGO_PENDIENTE' ? `<button class="btn warn xl mt" id="ePagar" type="button">Confirmar pago (administrador)</button>` : ''}
+    ${isAdmin() && r.codigo === 'YA_ENTREGADO' ? `<button class="btn sec mt" id="eRev" type="button" style="width:100%">Revertir esta entrega (administrador)</button>` : ''}
+    <button class="btn sec mt" id="eOtro" type="button" style="width:100%">Siguiente ticket</button>`;
+    const reset = () => { $('#eRes').innerHTML = ''; $('#eNum').value = ''; $('#eNum').focus(); };
+    $('#eOtro').onclick = reset;
+    if ($('#eConf')) $('#eConf').onclick = () => busy($('#eConf'), async () => {
+      try {
+        const x = await api('entregas.confirmar', { numero: t.numero, observaciones: $('#eObs').value });
+        $('#eRes').innerHTML = `<div class="verdict OK"><div class="big">✅ ENTREGADO</div><dl><dt>Ticket</dt><dd>${esc(x.numero)}</dd><dt>Comprador</dt><dd>${esc(x.comprador)}</dd><dt>Hora</dt><dd>${esc(x.fecha)}</dd></dl></div>`;
+        toast('Entrega registrada: ' + x.numero, 'ok');
+        $('#eNum').value = ''; $('#eNum').focus(); rec();
+      } catch (e) { fail(e); buscar(t.numero); }
+    });
+    if ($('#ePagar')) $('#ePagar').onclick = async () => {
+      const f = await modal('Confirmar pago', `<p>Ticket <b>${esc(t.numero)}</b> · ${esc(t.comprador)}</p><label>Método</label><select data-f="metodo_pago">${opts(S.info.config.metodos_pago, t.metodo_pago)}</select>`);
+      if (!f) return;
+      try { await api('ventas.confirmarPago', { venta_id: t.venta_id, metodo_pago: f.metodo_pago }); toast('Pago confirmado', 'ok'); buscar(t.numero); } catch (e) { fail(e); }
+    };
+    if ($('#eRev')) $('#eRev').onclick = async () => {
+      const f = await modal('Revertir entrega', `<div class="alert warn">La entrega no se borra: queda como REVERTIDO con tu motivo en auditoría.</div><label>Motivo <span class="req">*</span></label><textarea data-f="motivo"></textarea>`, [{ v: false, t: 'Cancelar', c: 'sec' }, { v: true, t: 'Revertir', c: 'danger' }]);
+      if (!f) return;
+      try { await api('entregas.revertir', { entrega_id: t.entrega_id, motivo: f.motivo }); toast('Entrega revertida', 'warn'); buscar(t.numero); rec(); } catch (e) { fail(e); }
+    };
+    if ($('#eConf')) $('#eConf').focus();
+  };
+  $('#fEnt').onsubmit = ev => { ev.preventDefault(); buscar(); };
+  $('#eNum').focus(); rec();
+}
+
+/* ================== TICKETS ================== */
+function vTickets() {
+  $('#main').innerHTML = `<h2>Tickets</h2>
+    ${isAdmin() ? `<div class="grid g2">
+      <div class="card"><h3>Generar tickets por rango</h3>
+        <div class="row"><div><label>Lote <span class="req">*</span></label><select id="gLote">${opts(S.info.lotes.map(l => ({ v: l.lote_id, t: l.lote_id + ' · ' + l.nombre_lote + ' (' + l.area + ')' })))}</select></div></div>
+        <div class="row mt"><div><label>Desde <span class="req">*</span></label><input id="gDesde" type="number" min="0" placeholder="1"></div><div><label>Hasta <span class="req">*</span></label><input id="gHasta" type="number" min="0" placeholder="100"></div></div>
+        <label class="mt">Vendedor asignado (opcional)</label><input id="gVend" list="dlV2"><datalist id="dlV2">${S.info.vendedores.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
+        <p class="muted">Formato: ${esc(S.info.config.formato_numeracion)}. Ej.: 1 → ${esc(S.info.config.formato_numeracion.replace(/0(?=[^0]*$)/, '1'))}. Los números que ya existan se omiten.</p>
+        <button class="btn" id="gBtn" type="button">Generar</button>
+        <details class="mt"><summary class="muted">Importar desde una lista</summary>
+          <label class="mt">Pega los números (uno por línea o separados por coma)</label><textarea id="iLista"></textarea>
+          <button class="btn sec mt" id="iBtn" type="button">Importar al lote seleccionado</button></details>
+      </div>
+      <div class="card"><h3>Reasignar / anular</h3>
+        <p class="muted">Solo se modifican tickets DISPONIBLES.</p>
+        <div class="row"><div><label>Desde</label><input id="aDesde" placeholder="1"></div><div><label>Hasta</label><input id="aHasta" placeholder="20"></div></div>
+        <div class="row mt"><div><label>Nuevo vendedor</label><input id="aVend" list="dlV2"></div><div><label>Mover a lote</label><select id="aLote">${opts(S.info.lotes.map(l => ({ v: l.lote_id, t: l.lote_id + ' · ' + l.nombre_lote })), '', '(no cambiar)')}</select></div></div>
+        <button class="btn sec mt" id="aBtn" type="button">Aplicar a rango</button>
+        <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+        <div class="row"><div><label>Ticket</label><input id="xNum" placeholder="000-001"></div><button class="btn danger" id="xAnu" type="button" style="flex:0 0 auto">Anular</button><button class="btn sec" id="xRea" type="button" style="flex:0 0 auto">Reactivar</button></div>
+      </div></div>` : ''}
+    <div class="card"><h3>Listado</h3>${filtrosHTML('ft')}
+      <div class="row mt"><div><label>Buscar</label><input id="tQ" placeholder="Número o comprador"></div></div>
+      <div id="tList" class="mt"></div></div>`;
+  const load = async () => {
+    $('#tList').innerHTML = '<div class="loading">Cargando…</div>';
+    try {
+      const d = await api('tickets.listar', Object.assign(leerFiltros('ft'), { q: $('#tQ').value }));
+      $('#tList').innerHTML = `<p class="muted">${d.total} ticket(s)${d.total > d.rows.length ? ', mostrando ' + d.rows.length : ''}</p>` + table([
+        { h: 'Ticket', f: r => `<b>${esc(r.numero)}</b>${demoB(r)}` }, { h: 'Lote', f: r => esc(r.lote_id) + `<div class="muted">${esc(r.area)}</div>` },
+        { h: 'Asignado a', k: 'vendedor_asignado' }, { h: 'Estado', f: r => badge(r.estado_ticket) },
+        { h: 'Comprador', k: 'comprador' }, { h: 'Pago', f: r => badge(r.estado_pago) },
+        { h: 'Entrega', f: r => r.entregado ? badge('ENTREGADO') + `<div class="muted">${esc(r.fecha_entrega)}</div>` : (r.venta_id ? badge('POR_RECOGER') : '') }
+      ], d.rows, 'Sin tickets. Un administrador puede generarlos arriba.');
+    } catch (e) { $('#tList').innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
+  };
+  onFiltros('ft', load);
+  let tmr; $('#tQ').oninput = () => { clearTimeout(tmr); tmr = setTimeout(load, 400); };
+  const refresh = async () => { S.info = await api('sesion.info'); };
+  if (isAdmin()) {
+    $('#gBtn').onclick = async () => {
+      const p = { lote_id: $('#gLote').value, desde: $('#gDesde').value, hasta: $('#gHasta').value, vendedor_asignado: $('#gVend').value };
+      if (p.desde === '' || p.hasta === '') return toast('Indica el rango.', 'warn');
+      if (!await modal('Generar tickets', `<p>Se crearán los tickets del <b>${esc(p.desde)}</b> al <b>${esc(p.hasta)}</b> en el lote <b>${esc(p.lote_id)}</b>.</p>`)) return;
+      await busy($('#gBtn'), async () => { try { const r = await api('tickets.generar', p); toast(`Creados: ${r.creados}. Ya existían: ${r.ya_existian.length}`, r.ya_existian.length ? 'warn' : 'ok'); await refresh(); load(); } catch (e) { fail(e); } });
+    };
+    $('#iBtn').onclick = () => busy($('#iBtn'), async () => {
+      try { const r = await api('tickets.importar', { lote_id: $('#gLote').value, lista: $('#iLista').value, vendedor_asignado: $('#gVend').value }); toast(`Importados: ${r.creados}. Repetidos en la lista: ${r.duplicados_en_lista.length}. Ya existían: ${r.ya_existian.length}`, 'ok'); $('#iLista').value = ''; await refresh(); load(); } catch (e) { fail(e); }
+    });
+    $('#aBtn').onclick = async () => {
+      const p = { desde: $('#aDesde').value, hasta: $('#aHasta').value };
+      if ($('#aVend').value.trim()) p.vendedor_asignado = $('#aVend').value.trim();
+      if ($('#aLote').value) p.lote_id = $('#aLote').value;
+      if (!p.desde || !p.hasta) return toast('Indica el rango.', 'warn');
+      if (!await modal('Reasignar tickets', `<p>Rango ${esc(p.desde)} – ${esc(p.hasta)}${p.vendedor_asignado ? '<br>Vendedor → ' + esc(p.vendedor_asignado) : ''}${p.lote_id ? '<br>Lote → ' + esc(p.lote_id) : ''}</p>`)) return;
+      try { const r = await api('tickets.asignar', p); toast(`Actualizados: ${r.actualizados}`, 'ok'); await refresh(); load(); } catch (e) { fail(e); }
+    };
+    const anuRea = async (accion) => {
+      const n = $('#xNum').value.trim(); if (!n) return toast('Escribe el número.', 'warn');
+      const f = await modal((accion === 'tickets.anular' ? 'Anular' : 'Reactivar') + ' ticket ' + n, `<label>Motivo <span class="req">*</span></label><textarea data-f="motivo"></textarea>`);
+      if (!f) return;
+      try { const r = await api(accion, { numero: n, motivo: f.motivo }); toast(`${r.numero} → ${r.estado}`, 'ok'); load(); } catch (e) { fail(e); }
+    };
+    $('#xAnu').onclick = () => anuRea('tickets.anular');
+    $('#xRea').onclick = () => anuRea('tickets.reactivar');
+  }
+  load();
+}
+
+/* ================== REPORTES ================== */
+function vReportes() {
+  $('#main').innerHTML = `<h2>Reportes</h2>${filtrosHTML('fr')}
+    <div class="row mt noprint"><button class="btn sec" id="rCsv" type="button" style="flex:0 0 auto">Descargar CSV</button><button class="btn sec" id="rPrint" type="button" style="flex:0 0 auto">Imprimir / PDF</button></div>
+    <div id="rep" class="mt"></div>`;
+  let data = null;
+  const load = async () => {
+    $('#rep').innerHTML = '<div class="loading">Cargando…</div>';
+    try {
+      data = await api('reportes.get', leerFiltros('fr'));
+      $('#rep').innerHTML = `<div class="card"><h3>Rendición de cuentas por vendedor</h3>${table([{ h: 'Vendedor', k: 'vendedor' }, { h: 'Tickets', k: 'tickets', r: 1 }, { h: 'Cobrado', f: r => money(r.cobrado), r: 1 }, { h: 'Efectivo', f: r => money(r.efectivo), r: 1 }, { h: 'Digital', f: r => money(r.digital), r: 1 }, { h: 'Por cobrar', f: r => money(r.por_cobrar), r: 1 }], data.rendicion, 'Sin ventas.')}</div>
+        <div class="card"><h3>Detalle de tickets (${data.total}) — lista de respaldo para el día de recojo</h3>${table([
+          { h: 'Ticket', f: r => `<b>${esc(r.numero)}</b>${demoB(r)}` }, { h: 'Lote', k: 'lote_id' }, { h: 'Vendedor', f: r => esc(r.vendedor || r.vendedor_asignado) },
+          { h: 'Comprador', k: 'comprador' }, { h: 'Estado', f: r => badge(r.estado_ticket) }, { h: 'Pago', f: r => badge(r.estado_pago) },
+          { h: 'Monto', f: r => r.venta_id ? money(r.precio) : '', r: 1 }, { h: 'Entrega', f: r => r.entregado ? esc(r.fecha_entrega) : (r.venta_id ? '☐' : '') }], data.rows)}
+          <p class="muted">Generado el ${esc(data.generado)}</p></div>`;
+    } catch (e) { $('#rep').innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
+  };
+  $('#rCsv').onclick = () => {
+    if (!data) return;
+    const cols = ['numero', 'lote_id', 'area', 'vendedor_asignado', 'estado_ticket', 'vendedor', 'comprador', 'telefono', 'estado_pago', 'metodo_pago', 'precio', 'fecha_venta', 'entregado', 'fecha_entrega', 'entregado_por', 'es_demo'];
+    const q = v => '"' + String(v === undefined || v === null ? '' : v).replace(/"/g, '""') + '"';
+    const csv = '﻿' + cols.join(';') + '\n' + data.rows.map(r => cols.map(c => q(r[c])).join(';')).join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    a.download = 'pollada_reporte_' + new Date().toISOString().slice(0, 10) + '.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+  $('#rPrint').onclick = () => window.print();
+  onFiltros('fr', load); load();
+}
+
+/* ================== CONFIGURACIÓN (ADMIN) ================== */
+function vConfig() {
+  $('#main').innerHTML = `<h2>Configuración</h2>
+    <div class="grid g2">
+      <div class="card"><h3>Parámetros del evento</h3><div id="cfgBox"></div><button class="btn mt" id="cfgSave" type="button">Guardar parámetros</button></div>
+      <div class="card"><h3>Lotes</h3><div id="lotBox"></div><button class="btn sec mt" id="lotNew" type="button">+ Nuevo lote</button></div>
+    </div>
+    <div class="card"><h3>Usuarios autorizados</h3><p class="muted">El dueño de la hoja entra con su cuenta Google. Los demás entran con su correo + PIN (se guarda solo un hash, nunca el PIN).</p><div id="usrBox"></div><button class="btn sec mt" id="usrNew" type="button">+ Nuevo usuario</button></div>
+    <div class="card"><h3>Datos DEMO y pruebas</h3>
+      <p class="muted">Los DEMO usan números DEMO-### y el lote LDEMO; nunca se mezclan con los reales y no aparecen en el dashboard por defecto.</p>
+      <div class="row"><button class="btn sec" id="dLoad" type="button">Cargar 30 tickets DEMO</button><button class="btn" id="dTest" type="button">Ejecutar pruebas DEMO</button><button class="btn danger" id="dArch" type="button">Archivar DEMO</button></div>
+      <div id="dRes" class="mt"></div></div>
+    <div class="card"><h3>Auditoría (últimos 200 registros)</h3><div id="audBox"><button class="btn sec" id="audLoad" type="button">Ver auditoría</button></div></div>`;
+
+  const renderCfg = () => {
+    const raw = S.info.configRaw || [];
+    $('#cfgBox').innerHTML = raw.filter(r => r.clave !== 'version_sistema').map(r => {
+      const sn = ['requiere_pago_confirmado', 'restringir_ventas_por_area', 'permitir_login_pin'].indexOf(r.clave) >= 0;
+      return `<label class="mt">${esc(r.clave)} <span class="muted">${esc(r.descripcion)}</span></label>${sn ? `<select data-c="${esc(r.clave)}">${opts(['SI', 'NO'], String(r.valor).toUpperCase())}</select>` : `<input data-c="${esc(r.clave)}" value="${esc(r.valor)}">`}`;
+    }).join('') + `<p class="muted mt">Versión ${esc(S.info.config.version)}</p>`;
+    $('#lotBox').innerHTML = table([{ h: 'ID', k: 'lote_id' }, { h: 'Nombre', k: 'nombre_lote' }, { h: 'Área', k: 'area' }, { h: 'Responsable', k: 'responsable' }, { h: 'Tickets', f: r => `${r.cantidad_asignada}<div class="muted">${esc(r.rango_inicio)}${r.rango_fin ? ' – ' + esc(r.rango_fin) : ''}</div>` }, { h: 'Estado', f: r => badge(r.estado) }, { h: '', f: r => `<button class="btn sec sm" data-l="${esc(r.lote_id)}" type="button">Editar</button>` }], S.info.lotes);
+    $$('#lotBox [data-l]').forEach(b => b.onclick = () => editLote(S.info.lotes.find(l => l.lote_id === b.dataset.l)));
+  };
+  const reload = async () => { S.info = await api('sesion.info'); renderCfg(); };
+  const editLote = async (l) => {
+    l = l || { nombre_lote: '', area: '', responsable: '', estado: 'ACTIVO', observaciones: '' };
+    const f = await modal(l.lote_id ? 'Editar lote ' + l.lote_id : 'Nuevo lote', `<label>Nombre <span class="req">*</span></label><input data-f="nombre_lote" value="${esc(l.nombre_lote)}">
+      <label class="mt">Área</label><input data-f="area" value="${esc(l.area)}"><label class="mt">Responsable</label><input data-f="responsable" value="${esc(l.responsable)}">
+      <label class="mt">Estado</label><select data-f="estado">${opts(['ACTIVO', 'PENDIENTE', 'CERRADO'], l.estado)}</select>
+      <p class="muted">Solo se venden tickets de lotes ACTIVOS.</p><label>Observaciones</label><input data-f="observaciones" value="${esc(l.observaciones)}">`);
+    if (!f) return;
+    try { await api('lotes.guardar', Object.assign({ lote_id: l.lote_id }, f)); toast('Lote guardado', 'ok'); reload(); } catch (e) { fail(e); }
+  };
+  const loadUsers = async () => {
+    try {
+      const us = await api('usuarios.listar');
+      $('#usrBox').innerHTML = table([{ h: 'ID', k: 'usuario_id' }, { h: 'Nombre', k: 'nombre' }, { h: 'Correo', k: 'correo' }, { h: 'Rol', f: r => `<span class="b VENDIDO">${esc(r.rol)}</span>` }, { h: 'Área', k: 'area' }, { h: 'Estado', f: r => `<span class="b ${r.estado === 'ACTIVO' ? 'PAGADO' : 'ANULADO'}">${esc(r.estado)}</span>` }, { h: 'PIN', f: r => r.tiene_pin ? '✔' : '—' }, { h: 'Último acceso', k: 'ultimo_acceso' }, { h: '', f: r => `<button class="btn sec sm" data-u="${esc(r.usuario_id)}" type="button">Editar</button>` }], us);
+      $$('#usrBox [data-u]').forEach(b => b.onclick = () => editUser(us.find(u => u.usuario_id === b.dataset.u)));
+    } catch (e) { fail(e); }
+  };
+  const editUser = async (u) => {
+    u = u || { nombre: '', correo: '', rol: 'VENTAS', area: '', estado: 'ACTIVO' };
+    const f = await modal(u.usuario_id ? 'Editar usuario' : 'Nuevo usuario', `<label>Nombre <span class="req">*</span></label><input data-f="nombre" value="${esc(u.nombre)}">
+      <label class="mt">Correo <span class="req">*</span></label><input data-f="correo" type="email" value="${esc(u.correo)}">
+      <label class="mt">Rol</label><select data-f="rol">${opts([{ v: 'ADMIN', t: 'ADMIN – configura y corrige' }, { v: 'VENTAS', t: 'VENTAS – registra ventas' }, { v: 'ENTREGAS', t: 'ENTREGAS – valida recojos' }, { v: 'LECTURA', t: 'LECTURA – solo reportes' }], u.rol)}</select>
+      <label class="mt">Área</label><input data-f="area" value="${esc(u.area)}">
+      <label class="mt">Estado</label><select data-f="estado">${opts(['ACTIVO', 'INACTIVO'], u.estado)}</select>
+      <label class="mt">${u.usuario_id ? 'Nuevo PIN (dejar vacío para no cambiar)' : 'PIN (6 a 10 dígitos)'}</label><input data-f="pin" inputmode="numeric" autocomplete="new-password">
+      <p class="muted">Entrega el PIN en privado. Si cambias el correo, debes asignar un PIN nuevo.</p>`);
+    if (!f) return;
+    try { await api('usuarios.guardar', Object.assign({ usuario_id: u.usuario_id }, f)); toast('Usuario guardado', 'ok'); loadUsers(); } catch (e) { fail(e); }
+  };
+  $('#cfgSave').onclick = async () => {
+    const valores = {}; $$('#cfgBox [data-c]').forEach(i => valores[i.dataset.c] = i.value);
+    if (!await modal('Guardar parámetros', '<p>Los cambios aplican de inmediato para todos los usuarios y quedan en auditoría.</p>')) return;
+    try { const r = await api('config.guardar', { valores }); toast(`Parámetros actualizados: ${r.actualizados}`, 'ok'); reload(); } catch (e) { fail(e); }
+  };
+  $('#lotNew').onclick = () => editLote(null);
+  $('#usrNew').onclick = () => editUser(null);
+  $('#dLoad').onclick = () => busy($('#dLoad'), async () => { try { const r = await api('demo.cargar'); toast(r.mensaje, 'ok'); reload(); } catch (e) { fail(e); } });
+  $('#dTest').onclick = () => busy($('#dTest'), async () => {
+    try {
+      const r = await api('demo.pruebas');
+      $('#dRes').innerHTML = `<div class="alert ${r.ok ? 'ok' : 'err'}">${r.ok ? 'Todas las pruebas pasaron.' : 'Hay pruebas con error.'}</div>` + table([{ h: '', f: x => x.ok ? '✅' : '❌' }, { h: 'Caso', k: 'caso' }, { h: 'Detalle', f: x => `<span class="muted">${esc(x.detalle)}</span>` }], r.resultados);
+      reload();
+    } catch (e) { fail(e); }
+  });
+  $('#dArch').onclick = async () => {
+    if (!await modal('Archivar DEMO', '<div class="alert warn">Se moverán SOLO las filas DEMO (DEMO-###) a pestañas ARCHIVO_DEMO_*. Las ventas y entregas reales no se tocan. La auditoría se conserva.</div>', [{ v: false, t: 'Cancelar', c: 'sec' }, { v: true, t: 'Archivar', c: 'danger' }])) return;
+    try { const r = await api('demo.archivar'); toast(r.mensaje, 'ok'); reload(); } catch (e) { fail(e); }
+  };
+  $('#audLoad').onclick = async () => {
+    try { const a = await api('auditoria.listar'); $('#audBox').innerHTML = table([{ h: 'Fecha', k: 'fecha_hora' }, { h: 'Usuario', k: 'usuario' }, { h: 'Acción', k: 'accion' }, { h: 'ID', k: 'id_registro' }, { h: 'Antes', k: 'valor_anterior' }, { h: 'Después', k: 'valor_nuevo' }, { h: 'Motivo', k: 'motivo' }], a); } catch (e) { fail(e); }
+  };
+  renderCfg(); loadUsers();
+}
+
+boot();
+</script>

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pollada CCATina 2026</title>
+  <?!= include_('Styles'); ?>
+</head>
+<body data-vista="<?= vista ?>">
+  <header class="top">
+    <div class="brand">
+      <span class="logo">CCAT</span>
+      <div>
+        <div class="brand-title" id="brandTitle">Pollada CCATina 2026</div>
+        <div class="brand-sub" id="brandSub">Control de ventas y entregas</div>
+      </div>
+    </div>
+    <div class="user" id="userBox" hidden>
+      <span id="userName"></span><span class="role" id="userRole"></span>
+      <button class="btn ghost sm" id="btnLogout" type="button">Salir</button>
+    </div>
+  </header>
+  <nav class="tabs" id="tabs" hidden></nav>
+  <main id="main"><div class="loading">Cargando…</div></main>
+  <div id="toasts" aria-live="polite"></div>
+  <div class="modal-bg" id="modalBg" hidden><div class="modal" role="dialog" aria-modal="true" id="modal"></div></div>
+  <?!= include_('JavaScript'); ?>
+</body>
+</html>
